@@ -1,6 +1,6 @@
 #![feature(is_none_or)]
 
-use std::{net::TcpListener, sync::mpsc, time::Duration};
+use std::{io::ErrorKind, net::TcpListener, sync::{atomic::{AtomicUsize, Ordering}, mpsc}, time::Duration};
 
 use bevy::{
     app::ScheduleRunnerPlugin, prelude::*, state::app::StatesPlugin, utils::hashbrown::HashMap,
@@ -8,12 +8,12 @@ use bevy::{
 use clap::Parser;
 use engine::{GameClientConns, GamePlugin};
 use game_server::GameToGameServer;
-use lobby_server::{Connection, Player, PlayerId, ToGameServer};
+use lobby_server::{Connection, Player, PlayerId, PortRange, ToGameServer};
 
 #[derive(clap::Parser)]
 struct Options {
-    #[arg(default_value_t = 0)]
-    port: u16,
+    #[arg(default_value_t = PortRange::single(0))]
+    port: PortRange,
     #[arg(long)]
     direct_connect: bool,
     #[arg(long, default_value_t = 1)]
@@ -23,8 +23,31 @@ struct Options {
 fn main() {
     let options = Options::parse();
 
-    let server = TcpListener::bind(("0.0.0.0", options.port)).unwrap();
-    println!("{}", server.local_addr().unwrap());
+    let server = 'block: {
+        for port in options.port.range() {
+            match TcpListener::bind(("0.0.0.0", port)) {
+                Ok(server) => break 'block server,
+                Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                    continue;
+                }
+                Err(e) => {
+                    println!("{e}");
+                    break;
+                }
+            };
+        }
+        return;
+    };
+
+    let public_ip = reqwest::blocking::get("http://api.ipify.org")
+        .unwrap()
+        .text()
+        .unwrap();
+
+    let mut addr = server.local_addr().unwrap();
+    addr.set_ip(public_ip.parse().unwrap());
+
+    println!("{}", addr);
 
     let mut connections: HashMap<PlayerId, Connection> = HashMap::new();
     let mut players: HashMap<PlayerId, lobby_server::Player> = HashMap::new();
@@ -103,16 +126,6 @@ fn main() {
         let mut conn = Connection {
             conn: conn.conn.try_clone().unwrap(),
         };
-        std::thread::spawn(move || loop {
-            let msg = conn.read::<GameToGameServer>();
-            match msg {
-                Ok(_) => {}
-                Err(_) => {
-                    s.send(()).unwrap();
-                    break;
-                }
-            }
-        });
     }
 
     App::new()
@@ -132,6 +145,8 @@ fn main() {
         .insert_state(State::Running)
         .add_systems(Update, exit_on_all_conn_lost)
         .run();
+
+    println!("All players disconnected - exiting...");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, States)]

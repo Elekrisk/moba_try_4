@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 lobby-server = { path = "../lobby-server" }
 engine = { path = "../engine" }
-bevy = { version = "0.14", features = ["dynamic_linking"] }
-clap = {version = "4", features = ["derive"]}
+bevy = { version = "0.14", features = [] }
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking"] }

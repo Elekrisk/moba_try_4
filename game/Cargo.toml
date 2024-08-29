@@ -7,8 +7,9 @@ edition = "2021"
 lobby-server = { path = "../lobby-server" }
 game-server = { path = "../game-server" }
 engine = { path = "../engine" }
-bevy = { version = "0.14", features = ["dynamic_linking"] }
+bevy = { version = "0.14", features = ["file_watcher"] }
 sickle_ui = "0.2"
 clap = {version = "4", features = ["derive"]}
 uuid = {version = "1", features = ["v4"]}
 leafwing-input-manager = { version = "0.15" }
+parry2d = "0.17"

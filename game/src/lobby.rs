@@ -1,7 +1,8 @@
-use std::{net::TcpStream, sync::mpsc};
+use std::{net::{TcpStream, ToSocketAddrs}, sync::mpsc};
 
 use crate::{
-    button::{ButtonAction, ButtonPlugin, UiMyButtonExt as _}, Options, SkipLobby, TopLevelState
+    button::{ButtonAction, ButtonPlugin, UiMyButtonExt as _},
+    Options, SkipLobby, TopLevelState,
 };
 
 use bevy::{prelude::*, utils::HashMap};
@@ -56,7 +57,33 @@ fn cleanup(
 }
 
 fn setup(options: Res<Options>, skip_lobby: Option<Res<SkipLobby>>, mut commands: Commands) {
-    let stream = TcpStream::connect(("127.0.0.1", 51337)).unwrap();
+    let mut addr_string = options.lobby_ip.clone();
+    if !addr_string.contains(':') {
+        addr_string.push_str(":27300");
+    }
+    let addr = match addr_string.to_socket_addrs() {
+        Ok(mut addrs) => addrs.find(|addr| addr.is_ipv4()).unwrap(),
+        Err(e) => {
+            eprintln!("Invalid address {} ; {}", addr_string, e);
+            commands.add(|world: &mut World| {
+                world.send_event(AppExit::Error(1.try_into().unwrap()));
+            });
+            return;
+        }
+    };
+
+    println!("Connecting to {addr_string} @ {addr}...");
+
+    let stream = match TcpStream::connect(addr) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("Cannot connect to server at {} ; {}", addr, e);
+            commands.add(|world: &mut World| {
+                world.send_event(AppExit::Error(1.try_into().unwrap()));
+            });
+            return;
+        }
+    };
 
     let (s, recv) = mpsc::channel();
 
@@ -178,13 +205,16 @@ fn settings_menu(builder: &mut UiBuilder<Entity>) {
 fn listen_for_events(
     options: Res<Options>,
     mut transaction_info: Local<HashMap<PlayerId, String>>,
-    mut conn: NonSendMut<LobbyServerConn>,
+    mut conn: Option<NonSendMut<LobbyServerConn>>,
     mut cache: ResMut<CachedPlayerInfo>,
     mut lobby_joined: EventWriter<JoinedLobby>,
     mut events: EventWriter<LobbyStateChange>,
     my_id: Option<Res<MyPlayerId>>,
     mut commands: Commands,
 ) {
+    let Some(mut conn) = conn else {
+        return;
+    };
     while let Ok(msg) = conn.recv.try_recv() {
         match msg {
             ServerMessage::LobbyJoined(lobby) => conn

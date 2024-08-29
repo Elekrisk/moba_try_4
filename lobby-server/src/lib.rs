@@ -1,12 +1,16 @@
+#![feature(new_range_api)]
+
+use core::range::RangeInclusive;
 use std::{
     collections::HashMap,
-    fmt::Display,
-    io::{self, Read, Write},
+    error::Error,
+    fmt::{Display, Write},
+    io::{self, Read, Write as _},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    str::FromStr,
     sync::mpsc,
 };
 
-use anyhow::Ok;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,22 +46,36 @@ pub struct Connection {
 
 impl Connection {
     pub fn read<T: for<'de> Deserialize<'de> + std::fmt::Debug>(&mut self) -> anyhow::Result<T> {
+        // let thread = std::thread::current();
+        // let thread_name = thread.name().unwrap_or("<unnamed>");
+        // let thread_id = thread.id();
+        // let id = format!("{thread_name}:{thread_id:?}");
+        // println!("{id} -- Starting reading");
         let mut len = [0; std::mem::size_of::<u32>()];
         self.conn.read_exact(&mut len)?;
         let len = u32::from_be_bytes(len) as usize;
+        // println!("{id} -- Read length {len}");
         let mut buffer = vec![0; len];
         self.conn.read_exact(&mut buffer)?;
+        // println!("{id} -- Read bytes {:?}", String::from_utf8_lossy(&buffer));
         let t = serde_json::from_slice(&buffer)?;
-        println!("RECV {t:#?}");
+        // println!("{id} -- Read data {t:#?}");
         Ok(t)
     }
 
     pub fn write<T: Serialize + std::fmt::Debug>(&mut self, val: &T) -> anyhow::Result<()> {
+        // let thread = std::thread::current();
+        // let thread_name = thread.name().unwrap_or("<unnamed>");
+        // let thread_id = thread.id();
+        // let id = format!("{thread_name}:{thread_id:?}");
+        // println!("{id} -- Starting writing");
         let bytes = serde_json::to_string(&val)?;
         let len = bytes.len();
         self.conn.write_all(&u32::to_be_bytes(len as _))?;
+        // println!("{id} -- Wrote length {len}");
         self.conn.write_all(bytes.as_bytes())?;
-        println!("SEND {val:#?}");
+        // println!("{id} -- Wrote bytes {:?}", bytes);
+        // println!("{id} -- Wrote data {val:#?}");
         Ok(())
     }
 }
@@ -168,4 +186,71 @@ pub enum ToGameServer {
     Prepare {
         players: Vec<(Team, Player, PlayerToken)>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortRange {
+    pub first: u16,
+    pub last: u16,
+}
+
+impl PortRange {
+    pub fn new(first: u16, last: u16) -> Self {
+        Self { first, last }
+    }
+
+    pub fn single(port: u16) -> Self {
+        Self::new(port, port)
+    }
+
+    pub fn range(&self) -> RangeInclusive<u16> {
+        RangeInclusive { start: self.first, end: self.last }
+    }
+}
+
+#[derive(Debug)]
+pub enum PortRangeParseError {
+    CannotSplit,
+    Other(Box<dyn Error + Send + Sync>),
+}
+
+impl Display for PortRangeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortRangeParseError::CannotSplit => f.write_str("Invalid port range format"),
+            PortRangeParseError::Other(x) => x.fmt(f),
+        }
+    }
+}
+
+impl Error for PortRangeParseError {}
+
+impl FromStr for PortRange {
+    type Err = PortRangeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((first, last)) = s.split_once('-') {
+            Ok(Self::new(
+                first
+                    .parse()
+                    .map_err(|e| PortRangeParseError::Other(Box::new(e)))?,
+                last.parse()
+                    .map_err(|e| PortRangeParseError::Other(Box::new(e)))?,
+            ))
+        } else {
+            Ok(Self::single(
+                s.parse()
+                    .map_err(|e| PortRangeParseError::Other(Box::new(e)))?,
+            ))
+        }
+    }
+}
+
+impl Display for PortRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.first.fmt(f)?;
+        f.write_char('-');
+        self.last.fmt(f)?;
+        Ok(())
+    }
 }

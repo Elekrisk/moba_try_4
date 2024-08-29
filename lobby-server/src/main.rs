@@ -1,24 +1,52 @@
 #![feature(is_none_or)]
 
 use std::{
-    collections::HashMap,
-    io::BufRead,
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
-    process::{Command, Stdio},
-    sync::mpsc,
+    collections::HashMap, error::Error, fmt::Display, io::BufRead, net::{IpAddr, SocketAddr, TcpListener, TcpStream}, ops::Range, process::{Command, Stdio}, str::FromStr, sync::mpsc
 };
 
+use clap::Parser;
 use lobby_server::*;
 use uuid::Uuid;
 
+#[derive(Debug, clap::Parser)]
+struct Options {
+    #[arg(long)]
+    rewrite_to_localhost: bool,
+    #[arg(long, default_value_t = 27300)]
+    port: u16,
+    #[arg(long, default_value_t = PortRange::new(27301, 27400))]
+    game_server_port_range: PortRange,
+    #[arg(long, default_value_t = Mode::default())]
+    game_server_launch_mode: Mode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Mode {
+    #[default]
+    Cargo,
+    Binary,
+}
+
+impl Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mode::Cargo => "cargo",
+            Mode::Binary => "binary",
+        })
+    }
+}
+
 fn main() {
+    let options = Options::parse();
+
     let addr: IpAddr = "0.0.0.0".parse().unwrap();
-    let server = TcpListener::bind((addr, 51337)).unwrap();
+    let server = TcpListener::bind((addr, options.port)).unwrap();
 
     let mut state = State {
         players: HashMap::new(),
         connections: HashMap::new(),
         lobbies: HashMap::new(),
+        options,
     };
 
     let (s, r) = mpsc::channel();
@@ -62,6 +90,7 @@ pub struct State {
     players: HashMap<PlayerId, Player>,
     connections: HashMap<PlayerId, Connection>,
     lobbies: HashMap<LobbyId, Lobby>,
+    options: Options,
 }
 
 impl State {
@@ -223,8 +252,21 @@ impl State {
                     let lobby = self.lobbies.get(&lobby).unwrap();
 
                     // start game server
-                    let mut child = Command::new("cargo")
-                        .args(["run", "--bin=game-server"])
+                    let mut cmd = match self.options.game_server_launch_mode {
+                        Mode::Cargo => {
+                            let mut cmd = Command::new("cargo");
+                            cmd.args([
+                                "run",
+                                "--bin=game-server",
+                                "--release",
+                                "--",
+                            ]);
+                            cmd
+                        }
+                        Mode::Binary => Command::new("./game-server"),
+                    };
+                    let mut child = cmd
+                        .arg(&self.options.game_server_port_range.to_string())
                         .stdout(Stdio::piped())
                         .spawn()
                         .unwrap();
@@ -234,7 +276,10 @@ impl State {
                     reader.read_line(&mut buf).unwrap();
                     let buf = buf.trim();
                     println!("Starting server on {}", buf);
-                    let addr: SocketAddr = buf.parse().unwrap();
+                    let mut addr: SocketAddr = buf.parse().unwrap();
+                    if self.options.rewrite_to_localhost {
+                        addr.set_ip("127.0.0.1".parse().unwrap());
+                    }
                     let stream = TcpStream::connect(addr).unwrap();
                     let mut conn = Connection { conn: stream };
 
@@ -257,7 +302,7 @@ impl State {
 
                     std::thread::spawn(move || {
                         let mut buf = String::new();
-                        while reader.read_line(&mut buf).is_ok() {
+                        while reader.read_line(&mut buf).is_ok_and(|n| n > 0) {
                             print!("{buf}");
                             buf.clear();
                         }
