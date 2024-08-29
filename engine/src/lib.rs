@@ -97,7 +97,7 @@ impl<T: States + Copy> Plugin for GamePlugin<T> {
             Mode::Server => {
                 app.add_systems(OnEnter(self.run_in_state), server_setup);
                 app.add_systems(Update, read_game_requests.in_set(EventHandling));
-                app.add_systems(Update, sync_position.in_set(CoreGameplay));
+                // app.add_systems(Update, sync_position.in_set(CoreGameplay));
             }
         }
 
