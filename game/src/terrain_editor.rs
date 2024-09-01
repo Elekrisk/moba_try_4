@@ -2,7 +2,9 @@ use core::f32;
 use std::{cmp::Ordering, fmt::Display};
 
 use bevy::{ecs::world::Command, prelude::*};
-use engine::terrain::{Convert, PathGraph, Terrain, ToIsometry, M};
+use engine::{
+    actor::ActorId, terrain::{Convert, PathGraph, Terrain, ToIsometry, M}, CreateTerrain, DeleteActor, EditTerrain, GameRequest, GameServerConn, MoveActor, ReloadTerrain, SaveTerrain
+};
 use leafwing_input_manager::{
     plugin::InputManagerPlugin,
     prelude::{ActionState, InputMap},
@@ -154,6 +156,8 @@ impl Plugin for EditorViewModePlugin {
             KeyCode::KeyQ => ViewModeInput::SelectTool,
             KeyCode::KeyW => ViewModeInput::MoveTool,
             KeyCode::KeyM => ViewModeInput::Meshify,
+            KeyCode::KeyS => ViewModeInput::SaveTerrain,
+            KeyCode::KeyL => ViewModeInput::LoadTerrain,
         };
         app.insert_resource(input_map);
         app.insert_resource(ActionState::<ViewModeInput>::default());
@@ -166,6 +170,8 @@ impl Plugin for EditorViewModePlugin {
                 select_terrain.run_if(resource_equals(Tool::Select).and_then(just_clicked)),
                 move_terrain.run_if(resource_equals(Tool::Move)),
                 meshify.run_if(just_pressed(&ViewModeInput::Meshify)),
+                save_terrain.run_if(just_pressed(&ViewModeInput::SaveTerrain)),
+                load_terrain.run_if(just_pressed(&ViewModeInput::LoadTerrain)),
             )
                 .run_if(in_state(EditorState::View)),
         );
@@ -176,6 +182,9 @@ impl Plugin for EditorViewModePlugin {
 enum ViewModeInput {
     SelectTool,
     MoveTool,
+
+    SaveTerrain,
+    LoadTerrain,
 
     Meshify,
 }
@@ -214,9 +223,17 @@ fn select_terrain(
     }
 }
 
-fn delete_selected(selected: Query<Entity, With<Selected>>, mut commands: Commands) {
-    for e in &selected {
-        commands.entity(e).despawn_recursive();
+fn delete_selected(
+    selected: Query<(Entity, &ActorId), With<Selected>>,
+    mut conn: ResMut<GameServerConn>,
+    mut commands: Commands,
+) {
+    for (e, actor) in &selected {
+        conn.0
+            .write(&GameRequest::Editor(engine::EditorRequest::DeleteActor(
+                DeleteActor { actor: *actor },
+            )))
+            .unwrap();
     }
 }
 
@@ -235,7 +252,8 @@ fn move_terrain(
     mut last_pos: Local<Option<Vec2>>,
     input: Res<ActionState<Input>>,
     mouse_pos: Res<MouseWorldPos>,
-    mut terrain: Query<&mut Transform, With<Selected>>,
+    mut terrain: Query<(&mut Transform, &ActorId), With<Selected>>,
+    mut conn: ResMut<GameServerConn>,
 ) {
     let is_holding = input.pressed(&Input::LeftClick);
 
@@ -246,8 +264,16 @@ fn move_terrain(
         (true, Some(last_pos), Some(mouse_pos)) => {
             let diff = mouse_pos - *last_pos;
             if diff.length() > 0.0 {
-                for mut trans in &mut terrain {
+                for (mut trans, &actor) in &mut terrain {
                     trans.translation += diff.extend(0.0);
+                    conn.0
+                        .write(&GameRequest::Editor(engine::EditorRequest::MoveActor(
+                            MoveActor {
+                                actor,
+                                new_pos: trans.translation.xy(),
+                            },
+                        )))
+                        .unwrap();
                 }
                 *last_pos = mouse_pos;
             }
@@ -271,6 +297,14 @@ fn meshify(
         let material = asset_server.add(StandardMaterial::from_color(Color::srgb(1.0, 0.7, 0.4)));
         commands.entity(e).insert((handle, material));
     }
+}
+
+fn save_terrain(mut conn: ResMut<GameServerConn>) {
+    conn.0.write(&GameRequest::Editor(engine::EditorRequest::SaveTerrain(SaveTerrain))).unwrap();
+}
+
+fn load_terrain(mut conn: ResMut<GameServerConn>) {
+    conn.0.write(&GameRequest::Editor(engine::EditorRequest::ReloadTerrain(ReloadTerrain))).unwrap();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Resource)]
@@ -343,7 +377,7 @@ fn draw_active_object(object: Res<ActiveObject>, mut gizmos: Gizmos) {
 fn finalize_object_on_confirm(
     mut object: ResMut<ActiveObject>,
     mut next_state: ResMut<NextState<EditorState>>,
-    mut commands: Commands,
+    mut conn: ResMut<GameServerConn>,
 ) {
     fn is_ccw(vertices: &[Vec2]) -> bool {
         let (a_index, a) =
@@ -395,11 +429,14 @@ fn finalize_object_on_confirm(
     for vert in &mut vertices {
         *vert -= center;
     }
-    let terrain = Terrain::from_vertices(vertices);
-    commands.spawn((
-        SpatialBundle::from_transform(Transform::from_translation(center.extend(0.0))),
-        terrain,
-    ));
+    conn.0
+        .write(&GameRequest::Editor(engine::EditorRequest::CreateTerrain(
+            CreateTerrain {
+                terrain: vertices,
+                pos: center,
+            },
+        )))
+        .unwrap();
     next_state.set(EditorState::View);
 }
 
@@ -427,11 +464,12 @@ fn drag_nodes(
     mut dragging: Local<Option<(usize, Vec2)>>,
     input: Res<ActionState<Input>>,
     mouse_pos: Res<MouseWorldPos>,
-    mut terrain: Query<(&mut Terrain, &Transform), With<Selected>>,
+    mut terrain: Query<(&mut Terrain, &Transform, &ActorId), With<Selected>>,
+    mut conn: ResMut<GameServerConn>,
 ) {
     let holding = input.pressed(&Input::LeftClick);
 
-    let (mut terrain, transform) = terrain.single_mut();
+    let (mut terrain, transform, actor) = terrain.single_mut();
 
     fn find_closest_vertex(terrain: &Terrain, local_pos: Vec2) -> usize {
         let local_pos: Point<f32> = local_pos.conv();
@@ -462,8 +500,16 @@ fn drag_nodes(
             let mut verts = terrain.nodes.vertices().to_vec();
             let diff: Vector<f32> = diff.conv();
             verts[last_pos.0] += diff;
-            *terrain = Terrain::from_points(verts);
+            *terrain = Terrain::from_points(verts.clone());
             last_pos.1 = mouse_pos;
+            conn.0
+                .write(&GameRequest::Editor(engine::EditorRequest::EditTerrain(
+                    EditTerrain {
+                        actor: *actor,
+                        new_terrain: verts.into_iter().map(Convert::conv).collect(),
+                    },
+                )))
+                .unwrap();
         }
         (false, Some(_), _) => {
             *dragging = None;

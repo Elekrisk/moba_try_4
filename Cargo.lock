@@ -1805,12 +1805,14 @@ dependencies = [
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bevy",
  "lobby-server",
  "parry2d",
  "rand",
  "serde",
  "serde_json",
+ "sickle_ui",
  "uuid",
 ]
 

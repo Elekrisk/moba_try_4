@@ -6,9 +6,9 @@ use bevy::{
     app::ScheduleRunnerPlugin, prelude::*, state::app::StatesPlugin, utils::hashbrown::HashMap,
 };
 use clap::Parser;
-use engine::{GameClientConns, GamePlugin};
+use engine::{GameClientConns, GamePlugin, PlayerTeams};
 use game_server::GameToGameServer;
-use lobby_server::{Connection, Player, PlayerId, PortRange, ToGameServer};
+use lobby_server::{Connection, Player, PlayerId, PortRange, Team, ToGameServer};
 
 #[derive(clap::Parser)]
 struct Options {
@@ -51,6 +51,7 @@ fn main() {
 
     let mut connections: HashMap<PlayerId, Connection> = HashMap::new();
     let mut players: HashMap<PlayerId, lobby_server::Player> = HashMap::new();
+    let mut player_teams: HashMap<PlayerId, Team> = HashMap::new();
 
     if !options.direct_connect {
         // First connection is from lobby server
@@ -64,6 +65,8 @@ fn main() {
             .iter()
             .map(|(_, a, b)| (a.id, *b))
             .collect::<HashMap<_, _>>();
+
+        player_teams = players_list.iter().map(|(t, p, _)| (p.id, *t)).collect();
 
         players = players_list
             .into_iter()
@@ -141,6 +144,7 @@ fn main() {
         ))
         .insert_non_send_resource(Channel(r))
         .insert_resource(PlayerCount(players.len()))
+        .insert_resource(PlayerTeams(player_teams))
         .insert_resource(GameClientConns(connections))
         .insert_state(State::Running)
         .add_systems(Update, exit_on_all_conn_lost)

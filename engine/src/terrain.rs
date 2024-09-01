@@ -2,6 +2,7 @@ use core::f32;
 use std::{collections::BinaryHeap, time::Instant};
 
 use bevy::{
+    ecs::world::Command,
     gizmos::{clear_gizmo_context, gizmos::GizmoStorage},
     math::bounding::Bounded2d,
     prelude::*,
@@ -18,6 +19,10 @@ use parry2d::{
     query::{Ray, RayCast},
     shape::{PolygonalFeature, Polyline},
 };
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{actor::ActorId, GameClientConns, GameEvent};
 
 pub const EPS: f32 = 0.0001;
 
@@ -25,6 +30,9 @@ pub const EPS: f32 = 0.0001;
 pub struct Terrain {
     pub nodes: parry2d::shape::Polyline,
 }
+
+#[derive(Component)]
+pub struct CustomTerrain;
 
 impl Terrain {
     pub fn circle(radius: f32, vertex_count: usize) -> Self {
@@ -287,6 +295,8 @@ pub fn keep_path_graph_up_to_date(
 }
 
 fn extend_polyline(polyline: Polyline, amount: f32) -> Polyline {
+    let angle_limit = 30.0f32.to_radians();
+
     let mut vertices = vec![];
     for i in 0..polyline.num_segments() {
         let first = polyline.segment(i as _);
@@ -303,15 +313,39 @@ fn extend_polyline(polyline: Polyline, amount: f32) -> Polyline {
 
         let v = n1.angle_between(n2);
         // println!("Angle: {}", v.to_degrees());
-        let hv = v / 2.0;
-        let d = hv.tan() * amount;
 
-        let p = Vec2::new(first.b.x, first.b.y) + d1 * d + n1 * amount;
-        // println!("{d} -- {p}");
-        vertices.push(p.conv());
+        if v > angle_limit {
+            // println!("Angle {v} is > limit {angle_limit}");
+            let vert_count = (v / angle_limit).ceil() as usize;
+            // println!("Should be broken into {vert_count} vertices");
+            let per_vertex_angle = v / vert_count as f32;
+            // println!("Each having a {per_vertex_angle} angle");
+
+            for i in 0..vert_count {
+                let dir = Vec2::from_angle(per_vertex_angle * i as f32).rotate(n1);
+                // println!("{dir}");
+                let v = per_vertex_angle / 2.0;
+                // tan v = x
+                let x = v.tan();
+                let dir = dir + Vec2::Y.rotate(dir) * x;
+                let p = Vec2::new(first.b.x, first.b.y) + dir * amount;
+                vertices.push(p.conv());
+            }
+        } else {
+            let hv = v / 2.0;
+            let d = hv.tan() * amount;
+
+            let p = Vec2::new(first.b.x, first.b.y) + d1 * d + n1 * amount;
+            // println!("{d} -- {p}");
+            vertices.push(p.conv());
+        }
     }
 
-    Polyline::new(vertices, polyline.indices().to_vec().into())
+    let len = vertices.len() as u32;
+    Polyline::new(
+        vertices,
+        Some(Iterator::chain(Iterator::map(0..len - 1, |i| [i, i + 1]), [[len - 1, 0]]).collect()),
+    )
 }
 
 pub fn create_path_graph<'a, I: Iterator<Item = (&'a Terrain, &'a Transform)>>(
@@ -347,8 +381,8 @@ pub fn create_path_graph<'a, I: Iterator<Item = (&'a Terrain, &'a Transform)>>(
                 let normal = (first_normal + (-Vec2::Y).rotate(d2)).normalize();
                 let pos =
                     transform * first.b + parry2d::math::Vector::new(normal.x, normal.y) * EPS;
-                let min_range = d1.angle_between(normal).abs() - 0.001;
-                let max_range = d1.angle_between(-normal).abs() + 0.001;
+                let min_range = d1.angle_between(normal).abs() - 0.05;
+                let max_range = d1.angle_between(-normal).abs() + 0.05;
                 nodes.push(PathNode {
                     id: nodes.len(),
                     pos: pos.conv(),
@@ -573,4 +607,86 @@ impl MeshBuilder for PolyMeshBuilder {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, verts)
         .with_inserted_indices(Indices::U32(trimesh.indices().as_flattened().to_vec()))
     }
+}
+
+pub struct SaveTerrain;
+
+impl Command for SaveTerrain {
+    fn apply(self, world: &mut World) {
+        let path = "./terrain.json";
+
+        let data = TerrainSaveData {
+            terrain_objects: world
+                .query_filtered::<(&Terrain, &Transform), With<CustomTerrain>>()
+                .iter(world)
+                .map(|(terrain, trans)| {
+                    terrain
+                        .nodes
+                        .vertices()
+                        .iter()
+                        .copied()
+                        .map(|node| node.conv() + trans.translation.xy())
+                        .collect()
+                })
+                .collect(),
+        };
+
+        std::fs::write(path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+    }
+}
+
+pub struct LoadTerrain;
+
+impl Command for LoadTerrain {
+    fn apply(self, world: &mut World) {
+        let path = "./terrain.json";
+
+        for (e, actor) in world
+            .query_filtered::<(Entity, &ActorId), With<CustomTerrain>>()
+            .iter(world)
+            .map(|x| (x.0, *x.1))
+            .collect::<Vec<_>>()
+        {
+            world.entity_mut(e).despawn_recursive();
+            world
+                .resource_mut::<GameClientConns>()
+                .broadcast(&GameEvent::DeleteActor(actor));
+        }
+
+        let data: Result<TerrainSaveData, anyhow::Error> =
+            try { serde_json::from_slice(&std::fs::read(path)?)? };
+
+        let data = data.unwrap_or(TerrainSaveData {
+            terrain_objects: vec![],
+        });
+
+        for mut terrain in data.terrain_objects {
+            let mut center = Vec2::ZERO;
+            for vert in &terrain {
+                center += *vert;
+            }
+            center /= terrain.len() as f32;
+            for vert in &mut terrain {
+                *vert -= center;
+            }
+
+            let actor_id = ActorId(Uuid::new_v4());
+
+            world.spawn((
+                CustomTerrain,
+                actor_id,
+                TransformBundle::from_transform(Transform::from_translation(center.extend(0.0))),
+                Terrain::from_vertices(terrain.iter().copied()),
+            ));
+
+            world
+                .resource_mut::<GameClientConns>()
+                .broadcast(&GameEvent::CreateTerrain(actor_id, terrain, center));
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerrainSaveData {
+    terrain_objects: Vec<Vec<Vec2>>,
 }

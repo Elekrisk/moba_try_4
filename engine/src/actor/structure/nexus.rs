@@ -10,11 +10,12 @@ pub struct NexusData;
 pub struct NexusBuilder;
 
 fn bundle() -> impl Bundle {
-    Terrain::circle(2.0, 128)
+    Terrain::circle(2.0, 8)
 }
 
 impl ActorSpawner for NexusSpawner {
     type Data = NexusData;
+    type SendData = ();
 
     fn spawn(&self, pos: Vec2, data: Self::Data, commands: &mut Commands) -> crate::ActorSpawned {
         let id = ActorId(Uuid::new_v4());
@@ -48,7 +49,7 @@ impl ActorBuilder for NexusBuilder {
                 transform: Transform::from_translation(pos.extend(0.0)).looking_to(Vec3::Y, Vec3::Z),
                 ..default()
             },
-            // id,
+            data.actor_id,
             bundle(),
         ));
     }

@@ -378,7 +378,7 @@ fn create_lobby_screen(
                 );
             });
             builder.row(|builder| {
-                for team in Team::all() {
+                for team in (0..lobby.settings.team_count).map(Team) {
                     builder
                         .column(|builder| {
                             builder.label(LabelConfig {
@@ -386,7 +386,7 @@ fn create_lobby_screen(
                                 ..default()
                             });
 
-                            for player in lobby.players.get(&team).unwrap() {
+                            for player in lobby.players.get(&team).unwrap_or(&vec![]) {
                                 build_player_entry(&cache, *player, builder);
                             }
                         })

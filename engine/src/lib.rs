@@ -2,6 +2,7 @@
 #![feature(anonymous_lifetime_in_impl_trait)]
 #![feature(decl_macro)]
 #![feature(get_many_mut)]
+#![feature(try_blocks)]
 
 pub mod actor;
 pub mod anim;
@@ -16,29 +17,43 @@ use actor::{
         tower::{TowerBuilder, TowerData, TowerSpawner},
     },
     unit::{
-        champion::champ_1::{Champ1Builder, Champ1Data, Champ1Spawner},
+        attack::AttackTarget,
+        champion::champ_1::{AutoBuilder, Champ1Builder, Champ1Data, Champ1Spawner},
         UnitController, UnitControllerInfo,
     },
-    ActorId, MovementTarget,
+    ActorId, ActorMap, ActorPlugin, MovementTarget,
 };
 use bevy::{
-    asset::AssetEvents, ecs::system::RunSystemOnce, gizmos::gizmos::GizmoStorage, prelude::*,
+    asset::AssetEvents,
+    ecs::{intern::Interned, schedule::ScheduleLabel, system::RunSystemOnce},
+    gizmos::gizmos::GizmoStorage,
+    prelude::*,
     utils::HashMap,
 };
 use lobby_server::{Connection, PlayerId, Team};
 use parry2d::{
     math::{Isometry, Point, Vector},
-    query::{PointQuery, PointQueryWithLocation},
+    query::{PointProjection, PointQuery, PointQueryWithLocation},
     utils::point_in_poly2d,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use terrain::{keep_path_graph_up_to_date, Convert as _, PathGraph, Terrain};
+use terrain::{keep_path_graph_up_to_date, Convert as _, CustomTerrain, PathGraph, Terrain};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
     Client,
     Server,
+}
+
+impl Mode {
+    fn schedule(&self) -> Interned<dyn ScheduleLabel> {
+        match self {
+            Mode::Client => ScheduleLabel::intern(&FixedUpdate),
+            Mode::Server => ScheduleLabel::intern(&Update),
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -48,6 +63,31 @@ pub struct GameEventReader(mpsc::Receiver<GameEvent>);
 
 #[derive(Resource)]
 pub struct GameClientConns(pub HashMap<PlayerId, Connection>);
+
+impl GameClientConns {
+    pub fn send(&mut self, id: PlayerId, event: &GameEvent) {
+        self.0.get_mut(&id).unwrap().write(event).unwrap();
+    }
+
+    pub fn broadcast(&mut self, event: &GameEvent) {
+        for conn in self.0.values_mut() {
+            conn.write(event).unwrap();
+        }
+    }
+
+    pub fn broadcast_ignore(&mut self, event: &GameEvent, ignore: PlayerId) {
+        for (id, conn) in &mut self.0 {
+            if *id == ignore {
+                continue;
+            }
+
+            conn.write(event).unwrap();
+        }
+    }
+}
+
+#[derive(Resource)]
+pub struct PlayerTeams(pub HashMap<PlayerId, Team>);
 
 pub struct GameRequestReader(mpsc::Receiver<(PlayerId, GameRequest)>);
 
@@ -68,10 +108,9 @@ pub struct RenderDebug(pub bool);
 impl<T: States + Copy> Plugin for GamePlugin<T> {
     fn build(&self, app: &mut App) {
         use bevy::ecs::schedule::ScheduleLabel;
-        let active_schedule = match self.mode {
-            Mode::Client => ScheduleLabel::intern(&FixedUpdate),
-            Mode::Server => ScheduleLabel::intern(&Update),
-        };
+        app.add_plugins(ActorPlugin(self.mode));
+
+        let active_schedule = self.mode.schedule();
 
         app.configure_sets(
             active_schedule,
@@ -97,7 +136,7 @@ impl<T: States + Copy> Plugin for GamePlugin<T> {
             Mode::Server => {
                 app.add_systems(OnEnter(self.run_in_state), server_setup);
                 app.add_systems(Update, read_game_requests.in_set(EventHandling));
-                // app.add_systems(Update, sync_position.in_set(CoreGameplay));
+                app.add_systems(Update, sync_position.in_set(CoreGameplay));
             }
         }
 
@@ -109,9 +148,11 @@ impl<T: States + Copy> Plugin for GamePlugin<T> {
         app.add_systems(active_schedule, actor::move_to_target.in_set(CoreGameplay));
         app.add_systems(
             active_schedule,
-            (print_frame_time, keep_path_graph_up_to_date).in_set(CoreGameplay),
+            (keep_path_graph_up_to_date).in_set(CoreGameplay),
         );
         app.insert_resource(ActorKindRegistry::setup());
+
+        app.add_systems(Startup, setup_observer);
     }
 }
 
@@ -267,7 +308,11 @@ struct TimeStats {
 
 impl Default for TimeStats {
     fn default() -> Self {
-        Self { frames: vec![], max_frames: 60, frames_until_update: 60 }
+        Self {
+            frames: vec![],
+            max_frames: 60,
+            frames_until_update: 60,
+        }
     }
 }
 
@@ -286,10 +331,15 @@ impl TimeStats {
 
     fn print_stats(&self) {
         let avg = self.frames.iter().sum::<f32>() / self.frames.len() as f32;
-        let max = self.frames.iter().fold(f32::INFINITY, |a, b| a.min(*b)); 
+        let max = self.frames.iter().fold(f32::INFINITY, |a, b| a.min(*b));
         let min = self.frames.iter().fold(-f32::INFINITY, |a, b| a.max(*b));
 
-        println!("AVG: {:2.2} MIN {:2.2} MAX {:2.2}", 1.0/avg, 1.0/min, 1.0/max);
+        println!(
+            "AVG: {:2.2} MIN {:2.2} MAX {:2.2}",
+            1.0 / avg,
+            1.0 / min,
+            1.0 / max
+        );
     }
 }
 
@@ -312,17 +362,9 @@ fn read_game_events(
                 }
             }
             GameEvent::MovementTargetSet(actor, mut pos) => {
-                // println!(
-                //     "EVENT - {}",
-                //     SystemTime::now()
-                //         .duration_since(SystemTime::UNIX_EPOCH)
-                //         .unwrap()
-                //         .as_secs_f64()
-                // );
-
                 commands.add(move |world: &mut World| {
-                    for (mut target, id) in world
-                        .query::<(&mut MovementTarget, &ActorId)>()
+                    for (mut target, attack, id) in world
+                        .query::<(&mut MovementTarget, Option<&mut AttackTarget>, &ActorId)>()
                         .iter_mut(world)
                     {
                         if *id != actor {
@@ -330,46 +372,78 @@ fn read_game_events(
                         }
 
                         target.0 = Some(pos);
+                        if let Some(mut target) = attack {
+                            target.0 = None;
+                        }
                         break;
                     }
-                    // println!(
-                    //     "REQUE - {}",
-                    //     SystemTime::now()
-                    //         .duration_since(SystemTime::UNIX_EPOCH)
-                    //         .unwrap()
-                    //         .as_secs_f64()
-                    // );
                 });
             }
             GameEvent::PositionSync(actor, pos) => {
                 commands.add(move |world: &mut World| {
-                    for (mut client_pos, target, id) in
-                        world.query::<(&mut Transform, Option<&mut MovementTarget>, &ActorId)>().iter_mut(world)
+                    for (mut client_pos, target, id) in world
+                        .query::<(&mut Transform, Option<&mut MovementTarget>, &ActorId)>()
+                        .iter_mut(world)
                     {
                         if *id != actor {
                             continue;
                         }
 
                         let diff = (client_pos.translation.xy() - pos).length();
-                        println!("Sync diff: {diff}");
+                        // println!("Sync diff: {diff}");
                         if diff < 0.1 {
                             continue;
                         }
 
                         client_pos.translation = pos.extend(client_pos.translation.z);
                         if let Some(mut target) = target {
-                            println!("UPDATE TARGET");
+                            // println!("UPDATE TARGET");
                             target.set_changed();
                         }
                         break;
                     }
                 });
             }
+            GameEvent::CreateTerrain(actor, terrain, pos) => {
+                commands.spawn((
+                    actor,
+                    Terrain::from_vertices(terrain),
+                    SpatialBundle::from_transform(Transform::from_translation(pos.extend(0.0))),
+                ));
+            }
+            GameEvent::EditTerrain(actor, new_terrain) => {
+                commands.add(move |world: &mut World| {
+                    let map = world.resource::<ActorMap>();
+                    let e = *map.0.get(&actor).unwrap();
+                    *world.entity_mut(e).get_mut::<Terrain>().unwrap() =
+                        Terrain::from_vertices(new_terrain);
+                });
+            }
+            GameEvent::DeleteActor(actor) => {
+                commands.add(move |world: &mut World| {
+                    let map = world.resource::<ActorMap>();
+                    let e = *map.0.get(&actor).unwrap();
+                    world.entity_mut(e).despawn_recursive();
+                });
+            }
+            GameEvent::AttackTargetSet(a, b) => {
+                commands.add(move |world: &mut World| {
+                    let map = world.resource::<ActorMap>();
+                    let e_a = *map.0.get(&a).unwrap();
+                    let e_b = *map.0.get(&b).unwrap();
+                    
+                    world.entity_mut(e_a).get_mut::<AttackTarget>().unwrap().0 = Some(e_b);
+                });
+            }
         }
     }
 }
 
-fn server_setup(mut connections: ResMut<GameClientConns>, mut commands: Commands) {
+fn server_setup(
+    mut connections: ResMut<GameClientConns>,
+    player_teams: Res<PlayerTeams>,
+    mut commands: Commands,
+) {
     commands.add(|world: &mut World| {
         let conns = world.get_resource::<GameClientConns>().unwrap();
         let (s, r) = mpsc::channel();
@@ -382,10 +456,12 @@ fn server_setup(mut connections: ResMut<GameClientConns>, mut commands: Commands
             std::thread::spawn(move || loop {
                 match conn.read::<GameRequest>() {
                     Ok(msg) => {
+                        println!("{msg:#?}");
                         s.send((player_id, msg)).unwrap();
                     }
                     Err(_) => {
-                        s.send((player_id, GameRequest::Disconnect)).unwrap();
+                        s.send((player_id, GameRequest::Disconnect(Disconnect)))
+                            .unwrap();
                         break;
                     }
                 }
@@ -402,8 +478,10 @@ fn server_setup(mut connections: ResMut<GameClientConns>, mut commands: Commands
     spawns.push(TowerSpawner.spawn(Vec2::new(-40.0, -20.0), TowerData, &mut commands));
 
     for (player, _) in &connections.0 {
+        let team = *player_teams.0.get(player).unwrap();
         let data = Champ1Data {
             controller: UnitControllerInfo::Player(*player),
+            team,
         };
         let spawn = Champ1Spawner.spawn(Vec2::splat(-50.0), data, &mut commands);
 
@@ -420,63 +498,212 @@ fn server_setup(mut connections: ResMut<GameClientConns>, mut commands: Commands
             spawn = x;
         }
     }
+
+    commands.add(terrain::LoadTerrain);
 }
 
 fn read_game_requests(
     reader: NonSend<GameRequestReader>,
-    mut q: Query<(&ActorId, &UnitController, &mut MovementTarget)>,
-    graph: Res<PathGraph>,
-    mut connections: ResMut<GameClientConns>,
-    mut exit: EventWriter<AppExit>,
+    q: Query<(Entity, &UnitController)>,
+    mut commands: Commands,
 ) {
-    while let Ok((id, request)) = reader.0.try_recv() {
-        match request {
-            GameRequest::SetMovementTarget(mut pos) => {
-                // println!("TARGET {pos}");
-                for (terrain, isometry) in &graph.terrain {
-                    // println!("Checking terrain");
-                    if terrain.aabb(isometry).contains_local_point(&pos.conv()) {
-                        // println!("AABB contains point");
-                        let points = terrain.segments().map(|x| x.a).collect::<Vec<_>>();
-                        if point_in_poly2d(
-                            &isometry.inverse_transform_point(&pos.conv()),
-                            points.as_slice(),
-                        ) {
-                            // println!("Terrain contains point");
+    while let Ok((id, req)) = reader.0.try_recv() {
+        let e = q
+            .iter()
+            .find(|x| matches!(x.1, UnitController::Player(p) if *p == id))
+            .map(|x| x.0)
+            .unwrap_or(Entity::PLACEHOLDER);
 
-                            let (proj, (segment_id, loc)) = terrain.project_point_and_get_location(
-                                &isometry,
-                                &pos.conv(),
-                                true,
-                            );
-                            let segment = terrain.segment(segment_id);
-                            pos = (proj.point + *segment.normal().unwrap() * terrain::EPS).conv();
+        macro trigger($req:ident) {
+            commands.trigger_targets(
+                WithPlayer {
+                    player: id,
+                    event: $req,
+                },
+                e,
+            )
+        }
+
+        match req {
+            GameRequest::SetMovementTarget(req) => trigger!(req),
+            GameRequest::SetAttackTarget(req) => trigger!(req),
+            GameRequest::Disconnect(req) => trigger!(req),
+            GameRequest::Editor(req) => match req {
+                EditorRequest::CreateTerrain(req) => trigger!(req),
+                EditorRequest::MoveActor(req) => trigger!(req),
+                EditorRequest::DeleteActor(req) => trigger!(req),
+                EditorRequest::EditTerrain(req) => trigger!(req),
+                EditorRequest::SaveTerrain(req) => trigger!(req),
+                EditorRequest::ReloadTerrain(req) => trigger!(req),
+            },
+        }
+    }
+}
+fn setup_observer(mut commands: Commands) {
+    commands.observe(server_request_set_movement_target);
+    commands.observe(server_request_set_attack_target);
+    commands.observe(server_request_disconnect);
+    commands.observe(server_request_create_terrain);
+    commands.observe(server_request_edit_terrain);
+    commands.observe(server_request_move_actor);
+    commands.observe(server_request_delete_actor);
+    commands.observe(server_request_save_terrain);
+    commands.observe(server_request_reload_terrain);
+}
+
+fn server_request_set_movement_target(
+    trigger: Trigger<WithPlayer<SetMovementTarget>>,
+    graph: Res<PathGraph>,
+    mut q: Query<(&ActorId, &mut MovementTarget, Option<&mut AttackTarget>)>,
+    mut connections: ResMut<GameClientConns>,
+) {
+    let mut pos = trigger.event().event.0;
+    if let Ok((actor, mut target, attack)) = q.get_mut(trigger.entity()) {
+        for (terrain, isometry) in &graph.terrain {
+            if terrain.aabb(isometry).contains_local_point(&pos.conv()) {
+                let points = terrain.segments().map(|x| x.a).collect::<Vec<_>>();
+                if point_in_poly2d(
+                    &isometry.inverse_transform_point(&pos.conv()),
+                    points.as_slice(),
+                ) {
+                    let (proj, (segment_id, loc)) =
+                        terrain.project_point_and_get_location(&isometry, &pos.conv(), true);
+                    let segment = terrain.segment(segment_id);
+
+                    let normal = match loc {
+                        parry2d::shape::SegmentPointLocation::OnVertex(i) => {
+                            let other_id = match i {
+                                0 => {
+                                    if segment_id == 0 {
+                                        terrain.num_segments() as u32 - 1
+                                    } else {
+                                        segment_id - 1
+                                    }
+                                }
+                                1 => (segment_id + 1) % terrain.num_segments() as u32,
+                                _ => unreachable!(),
+                            };
+                            let other = terrain.segment(other_id);
+                            (*other.normal().unwrap() + *segment.normal().unwrap()).normalize()
                         }
-                    }
-                }
-                // println!("TARGET {pos}");
-
-                let (&actor, _, mut target) = q
-                    .iter_mut()
-                    .find(|x| matches!(x.1, UnitController::Player(p) if *p == id))
-                    .unwrap();
-
-                target.0 = Some(pos);
-
-                for conn in connections.0.values_mut() {
-                    conn.write(&GameEvent::MovementTargetSet(actor, pos))
-                        .unwrap();
-                }
-            }
-            GameRequest::Disconnect => {
-                connections.0.remove(&id);
-
-                if connections.0.is_empty() {
-                    exit.send(AppExit::Success);
+                        parry2d::shape::SegmentPointLocation::OnEdge(_) => {
+                            *segment.normal().unwrap()
+                        }
+                    };
+                    println!("{loc:#?}");
+                    pos = (proj.point + normal * terrain::EPS).conv();
                 }
             }
         }
+
+        target.0 = Some(pos);
+        if let Some(mut attack) = attack {
+            attack.0 = None;
+        }
+
+        connections.broadcast(&GameEvent::MovementTargetSet(*actor, pos));
     }
+}
+
+fn server_request_set_attack_target(
+    trigger: Trigger<WithPlayer<SetAttackTarget>>,
+    actor_map: Res<ActorMap>,
+    mut q: Query<(&ActorId, &mut AttackTarget)>,
+    mut connections: ResMut<GameClientConns>
+) {
+    let ev = &trigger.event().event;
+    let entity = actor_map.0.get(&ev.0).unwrap();
+    let (actor, mut target) = q.get_mut(trigger.entity()).unwrap();
+    target.0 = Some(*entity);
+    connections.broadcast(&GameEvent::AttackTargetSet(*actor, ev.0));
+}
+
+fn server_request_disconnect(
+    trigger: Trigger<WithPlayer<Disconnect>>,
+    mut connections: ResMut<GameClientConns>,
+    mut exit: EventWriter<AppExit>,
+) {
+    let ev = trigger.event();
+    connections.0.remove(&ev.player);
+
+    if connections.0.len() == 0 {
+        exit.send(AppExit::Success);
+    }
+}
+
+fn server_request_create_terrain(
+    trigger: Trigger<WithPlayer<CreateTerrain>>,
+    mut connections: ResMut<GameClientConns>,
+    mut commands: Commands,
+) {
+    let ev = trigger.event();
+
+    let actor_id = ActorId(Uuid::new_v4());
+
+    commands.spawn((
+        CustomTerrain,
+        actor_id,
+        Terrain::from_vertices(ev.event.terrain.iter().copied()),
+        TransformBundle::from_transform(Transform::from_translation(ev.event.pos.extend(0.0))),
+    ));
+
+    connections.broadcast(&GameEvent::CreateTerrain(
+        actor_id,
+        ev.event.terrain.clone(),
+        ev.event.pos,
+    ));
+}
+
+fn server_request_edit_terrain(
+    trigger: Trigger<WithPlayer<EditTerrain>>,
+    actor_map: Res<ActorMap>,
+    mut q: Query<&mut Terrain>,
+    mut connections: ResMut<GameClientConns>,
+) {
+    let ev = trigger.event();
+    let e = actor_map.0.get(&ev.event.actor).unwrap();
+    *q.get_mut(*e).unwrap() = Terrain::from_vertices(ev.event.new_terrain.iter().copied());
+    connections.broadcast_ignore(
+        &GameEvent::EditTerrain(ev.event.actor, ev.event.new_terrain.clone()),
+        ev.player,
+    );
+}
+
+fn server_request_move_actor(
+    trigger: Trigger<WithPlayer<MoveActor>>,
+    mut q: Query<&mut Transform>,
+    actor_map: Res<ActorMap>,
+    mut connections: ResMut<GameClientConns>,
+) {
+    let ev = trigger.event();
+    let e = actor_map.0.get(&ev.event.actor).unwrap();
+    q.get_mut(*e).unwrap().translation = ev.event.new_pos.extend(0.0);
+    for (player_id, conn) in connections.0.iter_mut() {
+        if *player_id == ev.player {
+            continue;
+        }
+        conn.write(&GameEvent::PositionSync(ev.event.actor, ev.event.new_pos))
+            .unwrap();
+    }
+}
+
+fn server_request_delete_actor(
+    trigger: Trigger<WithPlayer<DeleteActor>>,
+    actor_map: Res<ActorMap>,
+    mut connections: ResMut<GameClientConns>,
+    mut commands: Commands,
+) {
+    let ev = trigger.event();
+    let e = actor_map.0.get(&ev.event.actor).unwrap();
+    commands.entity(*e).despawn_recursive();
+    connections.broadcast(&GameEvent::DeleteActor(ev.event.actor));
+}
+
+fn server_request_save_terrain(_: Trigger<WithPlayer<SaveTerrain>>, mut commands: Commands) {
+    commands.add(terrain::SaveTerrain);
+}
+fn server_request_reload_terrain(_: Trigger<WithPlayer<ReloadTerrain>>, mut commands: Commands) {
+    commands.add(terrain::LoadTerrain);
 }
 
 fn sync_position(
@@ -506,14 +733,69 @@ pub struct Actor;
 pub enum GameEvent {
     ActorSpawned(ActorSpawned),
     MovementTargetSet(ActorId, Vec2),
+    AttackTargetSet(ActorId, ActorId),
     PositionSync(ActorId, Vec2),
+    CreateTerrain(ActorId, Vec<Vec2>, Vec2),
+    EditTerrain(ActorId, Vec<Vec2>),
+    DeleteActor(ActorId),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum GameRequest {
-    SetMovementTarget(Vec2),
-    Disconnect,
+    SetMovementTarget(SetMovementTarget),
+    SetAttackTarget(SetAttackTarget),
+    Disconnect(Disconnect),
+    Editor(EditorRequest),
 }
+
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct SetMovementTarget(pub Vec2);
+
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct SetAttackTarget(pub ActorId);
+
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct Disconnect;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum EditorRequest {
+    CreateTerrain(CreateTerrain),
+    MoveActor(MoveActor),
+    DeleteActor(DeleteActor),
+    EditTerrain(EditTerrain),
+    SaveTerrain(SaveTerrain),
+    ReloadTerrain(ReloadTerrain),
+}
+
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct WithPlayer<E> {
+    pub player: PlayerId,
+    pub event: E,
+}
+
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct CreateTerrain {
+    pub terrain: Vec<Vec2>,
+    pub pos: Vec2,
+}
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct MoveActor {
+    pub actor: ActorId,
+    pub new_pos: Vec2,
+}
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct DeleteActor {
+    pub actor: ActorId,
+}
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct EditTerrain {
+    pub actor: ActorId,
+    pub new_terrain: Vec<Vec2>,
+}
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct SaveTerrain;
+#[derive(Debug, Serialize, Deserialize, Event)]
+pub struct ReloadTerrain;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActorSpawned {
@@ -560,6 +842,7 @@ impl ActorKindRegistry {
         };
 
         registry.add(Champ1Builder);
+        registry.add(AutoBuilder);
         registry.add(TowerBuilder);
         registry.add(NexusBuilder);
 
@@ -589,6 +872,7 @@ pub trait ActorBuilder: Send + Sync {
 
 pub trait ActorSpawner {
     type Data;
+    type SendData: Serialize + for<'de> Deserialize<'de>;
     fn spawn(&self, pos: Vec2, data: Self::Data, commands: &mut Commands) -> ActorSpawned;
 }
 

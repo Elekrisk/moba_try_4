@@ -1,7 +1,10 @@
 use std::time::SystemTime;
 
 use bevy::{prelude::*, window::PrimaryWindow};
-use engine::{actor::unit::UnitController, CameraFocus, CoreGameplay, GameRequest, GameServerConn, RenderDebug};
+use engine::{
+    actor::{unit::{OnTeam, Unit, UnitController}, ActorId},
+    CameraFocus, CoreGameplay, GameRequest, GameServerConn, RenderDebug,
+};
 use leafwing_input_manager::{
     plugin::InputManagerPlugin,
     prelude::{ActionState, InputMap, MouseScroll, MouseScrollAxis, MouseScrollDirection},
@@ -202,28 +205,48 @@ fn handle_camera_control(
 }
 
 fn handle_unit_control(
-    q: Query<(&ActionState<Input>, &Transform)>,
+    q: Query<(&ActionState<Input>, &Transform, &OnTeam)>,
+
+    units: Query<(&ActorId, &Transform, &OnTeam), With<Unit>>,
+
     mouse_pos: Res<MouseWorldPos>,
-    mut camera_tracker: Query<&mut Transform, (With<CameraFocus>, Without<ActionState<Input>>)>,
+    mut camera_tracker: Query<&mut Transform, (With<CameraFocus>, Without<ActionState<Input>>, Without<Unit>)>,
     mut conn: ResMut<GameServerConn>,
     mut render_debug: ResMut<RenderDebug>,
 ) {
-    for (input, player_trans) in &q {
+    let unit_selection_dist = 0.5;
+    let unit_selection_dist = unit_selection_dist * unit_selection_dist;
+
+    for (input, player_trans, player_team) in &q {
         if input.just_pressed(&Input::RightClick)
             && let Some(mouse_pos) = mouse_pos.0
         {
-            // println!("MOVING");
+            let mut attack_unit = None;
 
-            // println!(
-            //     "\nCLICK - {}",
-            //     SystemTime::now()
-            //         .duration_since(SystemTime::UNIX_EPOCH)
-            //         .unwrap()
-            //         .as_secs_f64()
-            // );
-            conn.0
-                .write(&GameRequest::SetMovementTarget(mouse_pos))
-                .unwrap();
+            for (actor, unit_trans, unit_team) in &units {
+                if player_team.0 != unit_team.0 {
+                    let diff = (unit_trans.translation.xy() - mouse_pos).length_squared();
+                    if diff < unit_selection_dist {
+                        attack_unit = Some(*actor);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(actor) = attack_unit {
+                conn.0
+                    .write(&GameRequest::SetAttackTarget(engine::SetAttackTarget(
+                        actor,
+                    )))
+                    .unwrap();
+            } else {
+                conn.0
+                    .write(&GameRequest::SetMovementTarget(engine::SetMovementTarget(
+                        mouse_pos,
+                    )))
+                    .unwrap();
+            }
+
         }
 
         if input.pressed(&Input::FocusCamera) {

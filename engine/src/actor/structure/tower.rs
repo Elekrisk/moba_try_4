@@ -13,7 +13,7 @@ pub struct TowerSpawner;
 
 impl TowerSpawner {
     fn bundle() -> impl Bundle {
-        Terrain::circle(1.0, 128)
+        Terrain::circle(1.0, 8)
     }
 }
 
@@ -21,6 +21,7 @@ pub struct TowerData;
 
 impl ActorSpawner for TowerSpawner {
     type Data = TowerData;
+    type SendData = ();
 
     fn spawn(
         &self,
@@ -32,6 +33,7 @@ impl ActorSpawner for TowerSpawner {
 
         commands.spawn((
             TransformBundle::from_transform(Transform::from_translation(pos.extend(0.0))),
+            id,
             Self::bundle()
         ));
 
@@ -72,6 +74,7 @@ impl ActorBuilder for TowerBuilder {
                 transform: Transform::from_translation(pos.extend(1.0)).looking_to(Vec3::Y, Vec3::Z),
                 ..default()
             },
+            data.actor_id,
             TowerSpawner::bundle()
         ));
     }

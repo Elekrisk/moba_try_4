@@ -1,53 +1,54 @@
 use std::time::Duration;
 
 use bevy::{prelude::*, scene::SceneInstance, utils::default};
-use lobby_server::Team;
+use lobby_server::{PlayerId, Team};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     actor::{
-        unit::{ServerUnitBundle, UnitBundle, UnitController, UnitControllerInfo},
-        ActorBundle, ActorId, ServerActorBundle,
-    },
-    actor_id,
-    anim::{AnimationController, AnimationInfo, AnimationKind},
-    terrain::M,
-    ActorBuilder, ActorKindId, ActorSpawned, ActorSpawner, ActorType, Stats, UnitData,
+        actor_bundle, health::Health, projectile::{Projectile, ProjectileHit, ProjectileSpeed, ProjectileTarget}, unit::{attack::{AttackEvent, AttackType}, unit_bundle, ServerUnitBundle, Unit, UnitBundle, UnitController, UnitControllerInfo}, ActorBundle, ActorId, ActorMap, MovementPath, MovementTarget, ServerActorBundle
+    }, actor_id, anim::{AnimationController, AnimationInfo, AnimationKind}, terrain::M, ActorBuilder, ActorKindId, ActorSpawned, ActorSpawner, ActorType, GameClientConns, GameEvent, Stats, UnitData
 };
 
 use super::{ChampionBundle, ServerChampionBundle};
 
 pub struct Champ1Spawner;
 
+fn bundle(id: ActorId, transform: Transform, player_id: PlayerId, team: Team) -> impl Bundle {
+    (
+        unit_bundle(id, transform, UnitController::Player(player_id), team),
+        AttackType::Ranged,
+        Health { health: 100.0 }
+    )
+}
+
 impl ActorSpawner for Champ1Spawner {
     type Data = Champ1Data;
+    type SendData = Champ1Data;
 
     fn spawn(&self, pos: Vec2, data: Self::Data, commands: &mut Commands) -> ActorSpawned {
         let actor_id = ActorId(Uuid::new_v4());
-        commands.spawn(ServerChamp1Bundle {
-            champ: ServerChampionBundle {
-                unit: ServerUnitBundle {
-                    actor: ServerActorBundle {
-                        transform: TransformBundle::from_transform(Transform::from_translation(
-                            pos.extend(0.0),
-                        )),
-                        actor: actor_id,
-                        ..default()
-                    },
-                    unit: crate::actor::unit::Unit,
-                    controller: match data.controller {
-                        UnitControllerInfo::Player(id) => UnitController::Player(id),
-                    },
-                },
+        commands.spawn((bundle(
+            actor_id,
+            Transform::from_translation(pos.extend(0.0)),
+            match data.controller {
+                UnitControllerInfo::Player(id) => id,
             },
+            data.team,
+        ),)).observe(|trigger: Trigger<AttackEvent>, actor: Query<&ActorId>, trans: Query<&Transform>, mut commands: Commands, mut connections: ResMut<GameClientConns>| {
+            let ev = trigger.event();
+            let target = actor.get(ev.0).unwrap();
+            let trans = trans.get(trigger.entity()).unwrap();
+            let spawn = AutoSpawner.spawn(trans.translation.xy(), *target, &mut commands);
+            connections.broadcast(&GameEvent::ActorSpawned(spawn));
         });
 
         ActorSpawned {
             actor_id,
             pos,
             actor_type: ActorType::Unit(UnitData {
-                team: Team::Red,
+                team: Team(0),
                 stats: Stats {
                     max_health: 1.0,
                     max_mana: 1.0,
@@ -72,6 +73,7 @@ pub struct Champ1Builder;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Champ1Data {
     pub controller: UnitControllerInfo,
+    pub team: Team,
 }
 
 #[derive(Default, Bundle)]
@@ -103,7 +105,7 @@ impl ActorBuilder for Champ1Builder {
         &self,
         data: crate::ActorSpawned,
         asset_server: &AssetServer,
-        mut commands: &mut bevy::prelude::Commands,
+        commands: &mut bevy::prelude::Commands,
     ) {
         let base_path = "champ1.glb";
         let mut graph = AnimationGraph::new();
@@ -121,26 +123,16 @@ impl ActorBuilder for Champ1Builder {
         let champ_1_data: Champ1Data = serde_json::from_slice(&data.data).unwrap();
         commands
             .spawn((
-                Champ1Bundle {
-                    champ: ChampionBundle {
-                        unit: UnitBundle {
-                            actor: ActorBundle {
-                                actor: data.actor_id,
-                                ..default()
-                            },
-                            unit: crate::actor::unit::Unit,
-                            controller: match champ_1_data.controller {
-                                UnitControllerInfo::Player(id) => UnitController::Player(id),
-                            },
-                        },
+                bundle(
+                    data.actor_id,
+                    Transform::from_translation(data.pos.extend(0.0)).looking_at(Vec3::Y, Vec3::Z),
+                    match champ_1_data.controller {
+                        UnitControllerInfo::Player(id) => id,
                     },
-                },
-                SceneBundle {
-                    scene: asset_server.load(GltfAssetLabel::Scene(0).from_asset("champ1.glb")),
-                    transform: Transform::from_translation(data.pos.extend(0.0))
-                        .looking_to(Vec3::Y, Vec3::Z),
-                    ..default()
-                },
+                    champ_1_data.team,
+                ),
+                VisibilityBundle::default(),
+                asset_server.load::<Scene>(GltfAssetLabel::Scene(0).from_asset("champ1.glb")),
                 AnimationInfo {
                     animations: [
                         (AnimationKind::Idle, idle),
@@ -169,5 +161,62 @@ impl ActorBuilder for Champ1Builder {
                     .insert(AnimationTransitions::new());
             },
         );
+    }
+}
+
+
+
+
+
+struct AutoSpawner;
+
+impl AutoSpawner {
+    actor_id!(ID = "e7abf683-1ff6-495a-93c2-9fd524f7d494");
+}
+
+impl ActorSpawner for AutoSpawner {
+    type Data = ActorId;
+
+    type SendData = ActorId;
+
+    fn spawn(&self, pos: Vec2, data: Self::Data, commands: &mut Commands) -> ActorSpawned {
+        let id = ActorId(Uuid::new_v4());
+
+        commands.spawn((
+            actor_bundle(id, Transform::from_translation(pos.extend(0.0))),
+            Projectile,
+            ProjectileTarget::Actor(data),
+            ProjectileSpeed(3.0),
+        ));
+
+        ActorSpawned { actor_id: id, pos, actor_type: ActorType::Projectile(crate::ProjectileData {  }), kind_id: Self::ID, data: serde_json::to_vec(&data).unwrap() }
+    }
+}
+
+pub struct AutoBuilder;
+
+impl ActorBuilder for AutoBuilder {
+    fn actor_kind_id(&self) -> ActorKindId {
+        AutoSpawner::ID
+    }
+
+    fn build(&self, data: ActorSpawned, asset_server: &AssetServer, commands: &mut Commands) {
+        let target: ActorId = serde_json::from_slice(&data.data).unwrap();
+        commands.spawn((
+            actor_bundle(data.actor_id, Transform::from_translation(data.pos.extend(1.0))),
+            Projectile,
+            ProjectileTarget::Actor(target),
+            ProjectileSpeed(3.0),
+            VisibilityBundle::default(),
+            asset_server.add(Sphere::new(0.5).mesh().build()),
+            asset_server.add(StandardMaterial::from_color(Color::srgb(1.0, 0.5, 0.5))),
+        )).observe(|trigger: Trigger<ProjectileHit>, actor_map: Res<ActorMap>, mut hp: Query<&mut Health>, mut commands: Commands| {
+            let ev = trigger.event();
+            let hit_entity = actor_map.0.get(&ev.0).unwrap();
+            if let Ok(mut hp) = hp.get_mut(*hit_entity) {
+                hp.health -= 10.0;
+            }
+            commands.entity(trigger.entity()).despawn_recursive();
+        });
     }
 }

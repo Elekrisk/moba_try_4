@@ -2,19 +2,63 @@ use core::f32;
 use std::{f32::consts::PI, time::{Duration, SystemTime}};
 
 use bevy::{
-    ecs::{component::Tick, system::SystemChangeTick},
-    prelude::*,
+    ecs::{component::{StorageType, Tick}, system::SystemChangeTick},
+    prelude::*, utils::HashMap,
 };
+use health::HealthBarPlugin;
+use projectile::ProjectilePlugin;
 use serde::{Deserialize, Serialize};
+use unit::UnitPlugin;
 use uuid::Uuid;
 
-use crate::{anim::{AnimationController, AnimationInfo, AnimationKind}, terrain::PathGraph};
+use crate::{anim::{AnimationController, AnimationInfo, AnimationKind}, terrain::PathGraph, Mode};
 
 pub mod unit;
 pub mod structure;
+pub mod health;
+pub mod projectile;
 
-#[derive(Default, Component, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ActorPlugin(pub Mode);
+
+impl Plugin for ActorPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ActorMap>();
+        app.add_plugins((UnitPlugin(self.0), ProjectilePlugin(self.0)));
+        if self.0 == Mode::Client {
+            app.add_plugins(HealthBarPlugin);
+        }
+    }
+}
+
+#[derive(Debug, Default, Resource)]
+pub struct ActorMap(pub HashMap<ActorId, Entity>);
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorId(pub Uuid);
+
+impl Component for ActorId {
+    const STORAGE_TYPE: StorageType = StorageType::Table;
+    
+    fn register_component_hooks(hooks: &mut bevy::ecs::component::ComponentHooks) {
+        hooks.on_insert(|mut world, e, _| {
+            let id = *world.entity(e).get::<Self>().unwrap();
+            world.resource_mut::<ActorMap>().0.insert(id, e);
+        });
+        hooks.on_remove(|mut world, e, _| {
+            let id = *world.entity(e).get::<Self>().unwrap();
+            world.resource_mut::<ActorMap>().0.remove(&id);
+        });
+    }
+}
+
+pub fn actor_bundle(id: ActorId, transform: Transform) -> impl Bundle {
+    (
+        id,
+        TransformBundle::from_transform(transform),
+        MovementTarget::default(),
+        MovementPath::default(),
+    )
+}
 
 #[derive(Default, Bundle)]
 pub struct ActorBundle {

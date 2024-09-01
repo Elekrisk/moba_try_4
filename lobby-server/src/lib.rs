@@ -19,22 +19,14 @@ pub struct PlayerId(pub Uuid);
 pub struct LobbyId(pub Uuid);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Team {
-    Red,
-    Blue,
-}
-
-impl Team {
-    pub fn all() -> [Team; 2] {
-        [Team::Red, Team::Blue]
-    }
-}
+pub struct Team(pub usize);
 
 impl Display for Team {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Team::Red => "Red",
-            Team::Blue => "Blue",
+        f.write_str(match self.0 {
+            0 => "Red",
+            1 => "Blue",
+            other => return write!(f, "Team {}", other + 1),
         })
     }
 }
@@ -110,8 +102,14 @@ pub enum ServerMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameSettings {
+    pub team_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lobby {
     pub id: LobbyId,
+    pub settings: GameSettings,
     pub players: HashMap<Team, Vec<PlayerId>>,
     pub leader: PlayerId,
 }
@@ -120,7 +118,8 @@ impl Lobby {
     pub fn new() -> Self {
         Self {
             id: LobbyId(Uuid::new_v4()),
-            players: [(Team::Red, vec![]), (Team::Blue, vec![])].into(),
+            settings: GameSettings { team_count: 2 },
+            players: HashMap::new(),
             leader: PlayerId(Uuid::nil()),
         }
     }
@@ -134,9 +133,9 @@ impl Lobby {
             .players_sorted()
             .into_iter()
             .min_by_key(|x| x.1.len())
-            .map_or(Team::Red, |x| x.0);
+            .map_or(Team(0), |x| x.0);
         let player_id = player;
-        self.players.get_mut(&team).unwrap().push(player);
+        self.players.entry(team).or_default().push(player);
 
         if self.leader.0.is_nil() {
             self.leader = player_id;
@@ -144,13 +143,17 @@ impl Lobby {
     }
 
     fn players_sorted(&self) -> Vec<(Team, &[PlayerId])> {
-        let mut players = self
-            .players
-            .iter()
-            .map(|(a, b)| (*a, b.as_slice()))
-            .collect::<Vec<_>>();
-        players.sort_by_key(|x| x.0);
-        players
+        (0..self.settings.team_count)
+            .map(|x| {
+                (
+                    Team(x),
+                    self.players
+                        .get(&Team(x))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
     }
 
     pub fn remove_player(&mut self, player_id: PlayerId) {
@@ -204,7 +207,10 @@ impl PortRange {
     }
 
     pub fn range(&self) -> RangeInclusive<u16> {
-        RangeInclusive { start: self.first, end: self.last }
+        RangeInclusive {
+            start: self.first,
+            end: self.last,
+        }
     }
 }
 
